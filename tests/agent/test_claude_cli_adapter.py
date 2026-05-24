@@ -156,12 +156,18 @@ def test_build_claude_cli_command_adds_hermes_mcp_config_when_enabled(monkeypatc
 
 def test_build_mcp_env_is_minimal_and_redacts_provider_keys(monkeypatch):
     monkeypatch.setenv("HERMES_HOME", "/tmp/hermes-home")
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-123")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "456")
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
 
     env = _build_mcp_env()
 
     assert env["HERMES_HOME"] == "/tmp/hermes-home"
+    assert env["HERMES_SESSION_ID"] == "session-123"
+    assert env["HERMES_KANBAN_TASK"] == "task-123"
+    assert env["HERMES_KANBAN_RUN_ID"] == "456"
     assert env["HERMES_QUIET"] == "1"
     assert env["HERMES_REDACT_SECRETS"] == "true"
     assert "PYTHONPATH" in env
