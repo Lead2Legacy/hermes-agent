@@ -91,10 +91,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     provider fallback.
     """
     if agent.api_mode == "claude_cli":
-        from agent.claude_cli_adapter import run_claude_cli_completion
+        from agent.claude_cli_adapter import run_claude_cli_streaming
 
         agent._touch_activity("calling Claude CLI")
-        return run_claude_cli_completion(api_kwargs)
+        return run_claude_cli_streaming(api_kwargs, agent=agent)
 
     result = {"response": None, "error": None}
     request_client_holder = {"client": None}
@@ -1210,22 +1210,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         raise InterruptedError("Agent interrupted before streaming API call")
 
     if agent.api_mode == "claude_cli":
-        from agent.claude_cli_adapter import run_claude_cli_completion
+        from agent.claude_cli_adapter import run_claude_cli_streaming
 
-        response = run_claude_cli_completion(api_kwargs)
-        content = ""
-        try:
-            content = response.choices[0].message.content or ""
-        except Exception:
-            content = ""
-        if content and agent._has_stream_consumers():
-            if on_first_delta:
-                try:
-                    on_first_delta()
-                except Exception:
-                    pass
-            agent._fire_stream_delta(content)
-        return response
+        return run_claude_cli_streaming(
+            api_kwargs,
+            agent=agent,
+            on_text_delta=agent._fire_stream_delta if agent._has_stream_consumers() else None,
+            on_first_delta=on_first_delta,
+        )
 
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch

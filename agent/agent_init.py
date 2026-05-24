@@ -415,6 +415,10 @@ def init_agent(
     agent._execution_thread_id: int | None = None  # Set at run_conversation() start
     agent._interrupt_thread_signal_pending = False
     agent._client_lock = threading.RLock()
+    agent._claude_session_id = None
+    agent._claude_session_model = None
+    agent._claude_session_manager = None
+    agent._claude_cli_process = None
 
     # /steer mechanism — inject a user note into the next tool result
     # without interrupting the agent. Unlike interrupt(), steer() does

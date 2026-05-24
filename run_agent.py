@@ -1620,6 +1620,11 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        try:
+            from agent.claude_cli_adapter import cancel_claude_cli
+            cancel_claude_cli(self)
+        except Exception:
+            pass
         # Signal all tools to abort any in-flight operations immediately.
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
