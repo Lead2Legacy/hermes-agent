@@ -123,8 +123,13 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def build_claude_cli_prompt(messages: list[dict[str, Any]]) -> str:
-    """Flatten Hermes/OpenAI-style messages into a Claude CLI print prompt."""
+def build_claude_cli_prompt(messages: list[dict[str, Any]], *, include_system: bool = True) -> str:
+    """Flatten Hermes/OpenAI-style messages into a Claude CLI print prompt.
+
+    When ``include_system`` is False, ``system`` and ``developer`` turns are
+    dropped from the prompt body — used by callers that route the system text
+    through ``--append-system-prompt-file`` instead of inline ``System:``.
+    """
     lines: list[str] = []
     role_labels = {
         "system": "System",
@@ -133,10 +138,13 @@ def build_claude_cli_prompt(messages: list[dict[str, Any]]) -> str:
         "assistant": "Assistant",
         "tool": "Tool",
     }
+    system_roles = {"system", "developer"}
     for msg in messages or []:
         if not isinstance(msg, dict):
             continue
         role = str(msg.get("role") or "user").strip().lower()
+        if not include_system and role in system_roles:
+            continue
         label = role_labels.get(role, role.title() or "User")
         text = _content_to_text(msg.get("content")).strip()
         if not text:
@@ -144,6 +152,37 @@ def build_claude_cli_prompt(messages: list[dict[str, Any]]) -> str:
         lines.append(f"{label}:\n{text}")
     lines.append("Assistant:")
     return "\n\n".join(lines)
+
+
+def extract_system_prompt_text(messages: list[dict[str, Any]]) -> str:
+    """Concatenate ``system`` and ``developer`` message bodies for Claude's --append-system-prompt-file."""
+    parts: list[str] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role not in {"system", "developer"}:
+            continue
+        text = _content_to_text(msg.get("content")).strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _write_system_prompt_file(text: str) -> str:
+    fh = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".md",
+        prefix="hermes-claude-system-",
+        delete=False,
+    )
+    try:
+        fh.write(text)
+        fh.flush()
+        return fh.name
+    finally:
+        fh.close()
 
 
 def build_claude_cli_resume_prompt(messages: list[dict[str, Any]]) -> str:
@@ -295,7 +334,13 @@ def _claude_mcp_tool_names() -> list[str]:
     return available_mcp_tool_names()
 
 
-def _build_claude_cli_command(claude_bin: str, model: str, api_kwargs: dict[str, Any]) -> tuple[list[str], str | None]:
+def _build_claude_cli_command(
+    claude_bin: str,
+    model: str,
+    api_kwargs: dict[str, Any],
+    *,
+    system_prompt_text: str | None = None,
+) -> tuple[list[str], str | None, str | None]:
     # Disable Claude Code's built-in shell. Hermes should own the execution
     # boundary; when MCP is enabled below, only explicitly allow-listed Hermes
     # MCP tools may add external capabilities.
@@ -312,6 +357,10 @@ def _build_claude_cli_command(claude_bin: str, model: str, api_kwargs: dict[str,
     ]
     if output_format == "stream-json":
         cmd.extend(["--include-partial-messages", "--verbose", "--setting-sources", "user"])
+    system_prompt_path: str | None = None
+    if system_prompt_text:
+        system_prompt_path = _write_system_prompt_file(system_prompt_text)
+        cmd.extend(["--append-system-prompt-file", system_prompt_path])
     session_id = api_kwargs.get("resume_session_id")
     if session_id:
         cmd.extend(["--resume", str(session_id)])
@@ -325,7 +374,7 @@ def _build_claude_cli_command(claude_bin: str, model: str, api_kwargs: dict[str,
             "--allowedTools",
             *_claude_mcp_tool_names(),
         ])
-    return cmd, mcp_config_path
+    return cmd, mcp_config_path, system_prompt_path
 
 
 def _parse_json_line(raw_line: str) -> dict[str, Any] | None:
@@ -738,8 +787,17 @@ def run_claude_cli_streaming(
                 attempt_kwargs["resume_session_id"] = attempt_session_id
             else:
                 attempt_kwargs.pop("resume_session_id", None)
-            prompt = build_claude_cli_resume_prompt(messages) if attempt_session_id else build_claude_cli_prompt(messages)
-            cmd, mcp_config_path = _build_claude_cli_command(_claude_binary(binary), model, attempt_kwargs)
+            # On resume, Claude has the system prompt baked into the session
+            # already — only send it on the initial (non-resume) attempt.
+            system_prompt_text = "" if attempt_session_id else extract_system_prompt_text(messages)
+            prompt = (
+                build_claude_cli_resume_prompt(messages)
+                if attempt_session_id
+                else build_claude_cli_prompt(messages, include_system=not system_prompt_text)
+            )
+            cmd, mcp_config_path, system_prompt_path = _build_claude_cli_command(
+                _claude_binary(binary), model, attempt_kwargs, system_prompt_text=system_prompt_text or None
+            )
             proc: subprocess.Popen | None = None
             try:
                 proc = _spawn_stream_process(cmd, prompt, env or sanitized_claude_cli_env())
@@ -778,11 +836,12 @@ def run_claude_cli_streaming(
                     setattr(agent, "_claude_cli_process", None)
                 if proc is not None and proc.poll() is None:
                     _terminate_process(proc)
-                if mcp_config_path:
-                    try:
-                        os.unlink(mcp_config_path)
-                    except OSError:
-                        pass
+                for path in (mcp_config_path, system_prompt_path):
+                    if path:
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
         if last_error:
             raise last_error
         raise ClaudeCliError("Claude CLI streaming failed without response")
@@ -807,9 +866,12 @@ def run_claude_cli_completion(
     """Run ``claude -p`` for a single text-only completion."""
     model = str(api_kwargs.get("model") or "").strip() or "claude-sonnet-4-6"
     messages = api_kwargs.get("messages") or []
-    prompt = build_claude_cli_prompt(messages)
+    system_prompt_text = extract_system_prompt_text(messages)
+    prompt = build_claude_cli_prompt(messages, include_system=not system_prompt_text)
     timeout = api_kwargs.get("timeout") or int(os.getenv("HERMES_CLAUDE_CLI_TIMEOUT", "120"))
-    cmd, mcp_config_path = _build_claude_cli_command(_claude_binary(binary), model, api_kwargs)
+    cmd, mcp_config_path, system_prompt_path = _build_claude_cli_command(
+        _claude_binary(binary), model, api_kwargs, system_prompt_text=system_prompt_text or None
+    )
     try:
         proc = subprocess.run(
             cmd,
@@ -825,11 +887,12 @@ def run_claude_cli_completion(
     except OSError as exc:
         raise ClaudeCliError(f"Claude CLI failed to start: {exc}") from exc
     finally:
-        if mcp_config_path:
-            try:
-                os.unlink(mcp_config_path)
-            except OSError:
-                pass
+        for path in (mcp_config_path, system_prompt_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "Claude CLI exited non-zero").strip()
         if _is_quota_text(detail):
