@@ -60,6 +60,15 @@ def _build_server() -> Any:
 
         def _make_handler(tool_name: str):
             def _dispatch(**kwargs: Any) -> str:
+                # FastMCP wraps **kwargs signatures as a single "kwargs" JSON
+                # parameter; clients send {"kwargs": {...}} and we receive
+                # kwargs={"kwargs": {...}}. Unwrap when that pattern is detected.
+                if (
+                    len(kwargs) == 1
+                    and "kwargs" in kwargs
+                    and isinstance(kwargs["kwargs"], dict)
+                ):
+                    kwargs = kwargs["kwargs"]
                 try:
                     return handle_function_call(tool_name, kwargs or {})
                 except Exception as exc:
