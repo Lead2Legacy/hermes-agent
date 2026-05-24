@@ -97,6 +97,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    # OPERATING_RULES.md — runbook tier loaded alongside SOUL.md when present.
+    # Kept separate from SOUL.md so identity stays small while procedural
+    # rules (channel discipline, peer-agent coordination, restart protocol)
+    # remain in the cached system prompt without bloating the persona.
+    if agent.load_soul_identity or not agent.skip_context_files:
+        _operating_rules_content = _r.load_operating_rules_md()
+        if _operating_rules_content:
+            stable_parts.append(_operating_rules_content)
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 

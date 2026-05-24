@@ -1310,6 +1310,29 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
     return head + marker + tail
 
 
+def _load_hermes_home_doc(filename: str) -> Optional[str]:
+    """Read a markdown doc from HERMES_HOME, scan/truncate, return stripped content or None."""
+    try:
+        from hermes_cli.config import ensure_hermes_home
+        ensure_hermes_home()
+    except Exception as e:
+        logger.debug("Could not ensure HERMES_HOME before loading %s: %s", filename, e)
+
+    doc_path = get_hermes_home() / filename
+    if not doc_path.exists():
+        return None
+    try:
+        content = doc_path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, filename)
+        content = _truncate_content(content, filename)
+        return content
+    except Exception as e:
+        logger.debug("Could not read %s from %s: %s", filename, doc_path, e)
+        return None
+
+
 def load_soul_md() -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
@@ -1317,25 +1340,17 @@ def load_soul_md() -> Optional[str]:
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
-    try:
-        from hermes_cli.config import ensure_hermes_home
-        ensure_hermes_home()
-    except Exception as e:
-        logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
+    return _load_hermes_home_doc("SOUL.md")
 
-    soul_path = get_hermes_home() / "SOUL.md"
-    if not soul_path.exists():
-        return None
-    try:
-        content = soul_path.read_text(encoding="utf-8").strip()
-        if not content:
-            return None
-        content = _scan_context_content(content, "SOUL.md")
-        content = _truncate_content(content, "SOUL.md")
-        return content
-    except Exception as e:
-        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
-        return None
+
+def load_operating_rules_md() -> Optional[str]:
+    """Load OPERATING_RULES.md from HERMES_HOME — runbook tier of the stable prompt.
+
+    Lives alongside SOUL.md so identity stays small and procedures can be
+    edited (e.g. via Mission Control's Bootstrap modal) without disturbing
+    the persona text.  Returns None when the file is absent or empty.
+    """
+    return _load_hermes_home_doc("OPERATING_RULES.md")
 
 
 def _load_hermes_md(cwd_path: Path) -> str:
