@@ -17,6 +17,7 @@ from agent.claude_cli_adapter import (
     build_claude_cli_prompt,
     build_claude_cli_resume_prompt,
     cancel_claude_cli,
+    extract_system_prompt_text,
     normalize_claude_cli_response,
     run_claude_cli_completion,
     run_claude_cli_streaming,
@@ -132,13 +133,14 @@ def test_build_claude_cli_command_adds_hermes_mcp_config_when_enabled(monkeypatc
         lambda: ["mcp__hermes-tools__skills_list", "mcp__hermes-tools__web_search"],
     )
 
-    cmd, config_path = _build_claude_cli_command(
+    cmd, config_path, system_prompt_path = _build_claude_cli_command(
         "/custom/claude",
         "claude-sonnet-4-6",
         {"mcp_tools": True},
     )
 
     assert config_path == "/tmp/hermes-tools.json"
+    assert system_prompt_path is None
     assert cmd == [
         "/custom/claude",
         "-p",
@@ -207,13 +209,14 @@ def test_build_claude_cli_command_enables_mcp_tools_by_default(monkeypatch):
         lambda: ["mcp__hermes-tools__terminal", "mcp__hermes-tools__read_file"],
     )
 
-    cmd, config_path = _build_claude_cli_command(
+    cmd, config_path, system_prompt_path = _build_claude_cli_command(
         "/custom/claude",
         "claude-sonnet-4-6",
         {},
     )
 
     assert config_path == "/tmp/hermes-tools.json"
+    assert system_prompt_path is None
     assert "--mcp-config" in cmd
     assert "--strict-mcp-config" in cmd
     assert "mcp__hermes-tools__terminal" in cmd
@@ -221,13 +224,14 @@ def test_build_claude_cli_command_enables_mcp_tools_by_default(monkeypatch):
 
 def test_build_claude_cli_command_respects_explicit_opt_out():
     """``mcp_tools=False`` kwarg suppresses MCP wiring even when env says on."""
-    cmd, config_path = _build_claude_cli_command(
+    cmd, config_path, system_prompt_path = _build_claude_cli_command(
         "/custom/claude",
         "claude-sonnet-4-6",
         {"mcp_tools": False},
     )
 
     assert config_path is None
+    assert system_prompt_path is None
     assert "--mcp-config" not in cmd
 
 
@@ -247,13 +251,14 @@ def _python_binary_with_script(binary, script):
 
 
 def test_build_claude_cli_command_stream_json_adds_resume_flags():
-    cmd, config_path = _build_claude_cli_command(
+    cmd, config_path, system_prompt_path = _build_claude_cli_command(
         "/custom/claude",
         "claude-opus-4-7",
         {"mcp_tools": False, "output_format": "stream-json", "resume_session_id": "sess_123"},
     )
 
     assert config_path is None
+    assert system_prompt_path is None
     assert "--output-format" in cmd
     assert "stream-json" in cmd
     assert "--include-partial-messages" in cmd
@@ -608,3 +613,105 @@ print(json.dumps({'type':'result','usage':{}}), flush=True)
 
     assert first == [True]
     assert starts == [("toolu_F", "read_file", {"path": "/x"})]
+
+
+# ---- Phase 4 polish: --append-system-prompt-file ----
+
+
+def test_extract_system_prompt_text_joins_system_and_developer_roles():
+    text = extract_system_prompt_text(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "Tone: concise."},
+            {"role": "assistant", "content": "sure"},
+        ]
+    )
+
+    assert text == "You are Hermes.\n\nTone: concise."
+
+
+def test_extract_system_prompt_text_returns_empty_when_no_system_roles():
+    assert extract_system_prompt_text([{"role": "user", "content": "hi"}]) == ""
+
+
+def test_build_claude_cli_prompt_include_system_false_drops_system_and_developer_turns():
+    prompt = build_claude_cli_prompt(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "developer", "content": "Be brief."},
+            {"role": "user", "content": "hi"},
+        ],
+        include_system=False,
+    )
+
+    assert "System:" not in prompt
+    assert "Developer:" not in prompt
+    assert "User:\nhi" in prompt
+
+
+def test_build_claude_cli_command_writes_system_prompt_file_when_given(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agent.claude_cli_adapter.tempfile.NamedTemporaryFile",
+        lambda **kw: open(tmp_path / "sys.md", "w", encoding="utf-8"),
+    )
+
+    cmd, config_path, system_prompt_path = _build_claude_cli_command(
+        "/custom/claude",
+        "claude-sonnet-4-6",
+        {"mcp_tools": False},
+        system_prompt_text="You are Hermes.",
+    )
+
+    assert config_path is None
+    assert system_prompt_path == str(tmp_path / "sys.md")
+    assert "--append-system-prompt-file" in cmd
+    idx = cmd.index("--append-system-prompt-file")
+    assert cmd[idx + 1] == str(tmp_path / "sys.md")
+    assert (tmp_path / "sys.md").read_text(encoding="utf-8") == "You are Hermes."
+
+
+def test_build_claude_cli_command_omits_system_prompt_flag_when_text_empty():
+    cmd, config_path, system_prompt_path = _build_claude_cli_command(
+        "/custom/claude",
+        "claude-sonnet-4-6",
+        {"mcp_tools": False},
+        system_prompt_text="",
+    )
+
+    assert system_prompt_path is None
+    assert "--append-system-prompt-file" not in cmd
+
+
+def test_run_claude_cli_completion_passes_system_via_file_and_cleans_up(monkeypatch, tmp_path):
+    captured: dict = {}
+    monkeypatch.setattr(
+        "agent.claude_cli_adapter.tempfile.NamedTemporaryFile",
+        lambda **kw: open(tmp_path / "sys.md", "w", encoding="utf-8"),
+    )
+
+    def fake_run(cmd, *, input, text, capture_output, timeout, env, check):
+        captured["cmd"] = cmd
+        captured["input"] = input
+        captured["system_file_exists"] = (tmp_path / "sys.md").exists()
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    run_claude_cli_completion(
+        {
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "system", "content": "You are Hermes."},
+                {"role": "user", "content": "hello"},
+            ],
+            "mcp_tools": False,
+        },
+        binary="/custom/claude",
+    )
+
+    assert "--append-system-prompt-file" in captured["cmd"]
+    assert "System:" not in captured["input"]
+    assert "User:\nhello" in captured["input"]
+    assert captured["system_file_exists"] is True
+    assert not (tmp_path / "sys.md").exists(), "system prompt file should be cleaned up after completion"
