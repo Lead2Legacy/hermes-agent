@@ -334,6 +334,7 @@ _VALID_API_MODES = {
     "codex_responses",
     "anthropic_messages",
     "bedrock_converse",
+    "claude_cli",
     # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
     # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
     # instead of Hermes' tool dispatch. Gated behind config key
@@ -1532,6 +1533,16 @@ def resolve_runtime_provider(
             "base_url": "moa://local",
             "api_key": "moa-virtual-provider",
             "source": "moa-virtual-provider",
+            "requested_provider": requested_provider,
+        }
+
+    if requested_provider == "claude-cli":
+        return {
+            "provider": "claude-cli",
+            "api_mode": "claude_cli",
+            "base_url": "claude-cli://local",
+            "api_key": "",
+            "source": "claude-cli",
             "requested_provider": requested_provider,
         }
 
