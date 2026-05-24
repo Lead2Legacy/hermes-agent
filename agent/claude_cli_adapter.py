@@ -377,19 +377,56 @@ def _event_error_text(event: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _strip_mcp_prefix(name: str) -> str:
+    """Strip the ``mcp__hermes-tools__`` prefix so tool names match the OpenAI surface."""
+    prefix = "mcp__hermes-tools__"
+    if isinstance(name, str) and name.startswith(prefix):
+        return name[len(prefix):]
+    return name
+
+
+def _extract_tool_result_text(content: Any) -> str:
+    """Pull the user-visible text out of a Claude ``tool_result`` content payload."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        if parts:
+            return "".join(parts)
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except Exception:
+        return str(content)
+
+
 class _StreamState:
     def __init__(self) -> None:
         self.pieces: list[str] = []
         self.usage: dict[str, Any] = {}
         self.session_id: str | None = None
         self.stop_reason: str | None = None
+        # Tool-event mirroring: track tool_use and tool_result blocks so we
+        # only fire each callback once even if the same id appears in both a
+        # streaming partial event and the final assistant message.
+        self.tool_calls: dict[str, dict[str, Any]] = {}
+        self.tool_results_seen: set[str] = set()
 
     @property
     def text(self) -> str:
         return "".join(self.pieces)
 
-    def apply_event(self, event: dict[str, Any]) -> list[str]:
+    def apply_event(self, event: dict[str, Any]) -> SimpleNamespace:
         deltas: list[str] = []
+        tool_starts: list[tuple[str, str, dict[str, Any]]] = []
+        tool_results: list[tuple[str, str, dict[str, Any], str]] = []
+
         session_id = _extract_session_id(event)
         if session_id:
             self.session_id = session_id
@@ -412,6 +449,9 @@ class _StreamState:
             containers.append(event["message"])
         if isinstance(result, dict):
             containers.append(result)
+        cb_start = event.get("content_block")
+        if isinstance(cb_start, dict):
+            containers.append({"content": [cb_start]})
 
         for container in containers:
             content = container.get("content")
@@ -419,7 +459,32 @@ class _StreamState:
                 deltas.append(content)
             elif isinstance(content, list):
                 for block in content:
-                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "tool_use":
+                        tid = block.get("id")
+                        name = block.get("name")
+                        if isinstance(tid, str) and isinstance(name, str) and tid not in self.tool_calls:
+                            display_name = _strip_mcp_prefix(name)
+                            args = block.get("input")
+                            args_dict: dict[str, Any] = args if isinstance(args, dict) else {}
+                            self.tool_calls[tid] = {"name": display_name, "input": args_dict}
+                            tool_starts.append((tid, display_name, args_dict))
+                    elif btype == "tool_result":
+                        tid = block.get("tool_use_id")
+                        if isinstance(tid, str) and tid not in self.tool_results_seen:
+                            self.tool_results_seen.add(tid)
+                            info = self.tool_calls.get(tid, {})
+                            tool_results.append(
+                                (
+                                    tid,
+                                    info.get("name", ""),
+                                    info.get("input", {}),
+                                    _extract_tool_result_text(block.get("content")),
+                                )
+                            )
+                    elif isinstance(block.get("text"), str):
                         deltas.append(block["text"])
         delta = event.get("delta")
         if isinstance(delta, dict) and isinstance(delta.get("text"), str):
@@ -430,7 +495,11 @@ class _StreamState:
 
         if deltas:
             self.pieces.extend(deltas)
-        return deltas
+        return SimpleNamespace(
+            text_deltas=deltas,
+            tool_starts=tool_starts,
+            tool_results=tool_results,
+        )
 
 
 class ClaudeSessionManager:
@@ -530,6 +599,8 @@ def _consume_stream_jsonl(
     model: str,
     on_text_delta: Callable[[str], None] | None = None,
     on_first_delta: Callable[[], None] | None = None,
+    on_tool_start: Callable[[str, str, dict[str, Any]], None] | None = None,
+    on_tool_result: Callable[[str, str, dict[str, Any], str], None] | None = None,
     interrupt_check: Callable[[], bool] | None = None,
     watchdog_seconds: int = 280,
 ) -> SimpleNamespace:
@@ -587,17 +658,30 @@ def _consume_stream_jsonl(
             if _is_stale_session_text(err_text):
                 _terminate_process(proc)
                 raise ClaudeCliStaleSessionError(err_text)
-        deltas = state.apply_event(event)
-        if deltas and on_text_delta:
-            if not first_delta_fired:
-                first_delta_fired = True
-                if on_first_delta:
-                    try:
-                        on_first_delta()
-                    except Exception:
-                        pass
-            for delta in deltas:
+        outcome = state.apply_event(event)
+        text_deltas = outcome.text_deltas
+        if (text_deltas or outcome.tool_starts or outcome.tool_results) and not first_delta_fired:
+            first_delta_fired = True
+            if on_first_delta:
+                try:
+                    on_first_delta()
+                except Exception:
+                    pass
+        if text_deltas and on_text_delta:
+            for delta in text_deltas:
                 on_text_delta(delta)
+        if on_tool_start:
+            for tc_id, name, args in outcome.tool_starts:
+                try:
+                    on_tool_start(tc_id, name, args)
+                except Exception:
+                    pass
+        if on_tool_result:
+            for tc_id, name, args, result_text in outcome.tool_results:
+                try:
+                    on_tool_result(tc_id, name, args, result_text)
+                except Exception:
+                    pass
 
     try:
         returncode = proc.wait(timeout=1)
@@ -633,6 +717,8 @@ def run_claude_cli_streaming(
     env: dict[str, str] | None = None,
     on_text_delta: Callable[[str], None] | None = None,
     on_first_delta: Callable[[], None] | None = None,
+    on_tool_start: Callable[[str, str, dict[str, Any]], None] | None = None,
+    on_tool_result: Callable[[str, str, dict[str, Any], str], None] | None = None,
 ) -> SimpleNamespace:
     """Run Claude CLI with stream-json output, session resume, usage, and cancellation."""
     model = str(api_kwargs.get("model") or "").strip() or "claude-sonnet-4-6"
@@ -666,6 +752,8 @@ def run_claude_cli_streaming(
                     model=model,
                     on_text_delta=on_text_delta,
                     on_first_delta=on_first_delta,
+                    on_tool_start=on_tool_start,
+                    on_tool_result=on_tool_result,
                     interrupt_check=(lambda: bool(getattr(agent, "_interrupt_requested", False))) if agent is not None else None,
                     watchdog_seconds=int(os.getenv("HERMES_CLAUDE_CLI_WATCHDOG_SECONDS", "280")),
                 )

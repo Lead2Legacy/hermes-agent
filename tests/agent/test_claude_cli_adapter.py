@@ -9,8 +9,11 @@ from agent.claude_cli_adapter import (
     ClaudeCliError,
     ClaudeCliQuotaError,
     ClaudeSessionManager,
+    _StreamState,
     _build_claude_cli_command,
     _build_mcp_env,
+    _extract_tool_result_text,
+    _strip_mcp_prefix,
     build_claude_cli_prompt,
     build_claude_cli_resume_prompt,
     cancel_claude_cli,
@@ -408,3 +411,200 @@ def test_cancel_claude_cli_terminates_live_process():
     cancel_claude_cli(agent)
 
     assert proc.poll() is not None
+
+
+# ─── Phase 7: tool-event mirroring ─────────────────────────────────────────
+
+
+def test_strip_mcp_prefix_normalizes_hermes_tools_names():
+    assert _strip_mcp_prefix("mcp__hermes-tools__terminal") == "terminal"
+    assert _strip_mcp_prefix("plain_name") == "plain_name"
+    assert _strip_mcp_prefix("mcp__other__foo") == "mcp__other__foo"
+
+
+def test_extract_tool_result_text_handles_string_list_and_json():
+    assert _extract_tool_result_text("raw") == "raw"
+    assert _extract_tool_result_text([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]) == "ab"
+    assert _extract_tool_result_text(None) == ""
+    blob = _extract_tool_result_text({"key": "value"})
+    assert "key" in blob and "value" in blob
+
+
+def test_stream_state_extracts_tool_use_from_assistant_message():
+    state = _StreamState()
+    outcome = state.apply_event(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "mcp__hermes-tools__terminal",
+                        "input": {"command": "ls"},
+                    }
+                ]
+            },
+        }
+    )
+    assert outcome.text_deltas == []
+    assert outcome.tool_starts == [("toolu_1", "terminal", {"command": "ls"})]
+    assert outcome.tool_results == []
+
+
+def test_stream_state_extracts_tool_use_from_content_block_start_event():
+    state = _StreamState()
+    outcome = state.apply_event(
+        {
+            "type": "content_block_start",
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_2",
+                "name": "mcp__hermes-tools__read_file",
+                "input": {"path": "/x"},
+            },
+        }
+    )
+    assert outcome.tool_starts == [("toolu_2", "read_file", {"path": "/x"})]
+
+
+def test_stream_state_extracts_tool_result_and_pairs_with_prior_tool_use():
+    state = _StreamState()
+    state.apply_event(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_3",
+                        "name": "mcp__hermes-tools__write_file",
+                        "input": {"path": "/a", "content": "x"},
+                    }
+                ]
+            },
+        }
+    )
+    outcome = state.apply_event(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_3",
+                        "content": [{"type": "text", "text": "wrote 1 byte"}],
+                    }
+                ]
+            },
+        }
+    )
+    assert outcome.tool_results == [
+        ("toolu_3", "write_file", {"path": "/a", "content": "x"}, "wrote 1 byte")
+    ]
+
+
+def test_stream_state_deduplicates_repeated_tool_use_and_result_ids():
+    state = _StreamState()
+    payload = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_4",
+                    "name": "mcp__hermes-tools__terminal",
+                    "input": {"command": "ls"},
+                }
+            ]
+        },
+    }
+    first = state.apply_event(payload)
+    second = state.apply_event(payload)
+    assert len(first.tool_starts) == 1
+    assert second.tool_starts == []
+
+    result_payload = {
+        "type": "user",
+        "message": {
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_4", "content": "ok"}
+            ]
+        },
+    }
+    first_r = state.apply_event(result_payload)
+    second_r = state.apply_event(result_payload)
+    assert len(first_r.tool_results) == 1
+    assert second_r.tool_results == []
+
+
+def test_run_claude_cli_streaming_fires_tool_start_and_result_callbacks(tmp_path):
+    binary, script = _write_fake_claude(
+        tmp_path,
+        """
+import json, sys
+sys.stdin.read()
+print(json.dumps({'type':'system','session_id':'sess_tool'}), flush=True)
+print(json.dumps({
+    'type':'assistant',
+    'message':{'content':[
+        {'type':'tool_use','id':'toolu_X','name':'mcp__hermes-tools__terminal','input':{'command':'echo hi'}}
+    ]}
+}), flush=True)
+print(json.dumps({
+    'type':'user',
+    'message':{'content':[
+        {'type':'tool_result','tool_use_id':'toolu_X','content':[{'type':'text','text':'hi'}]}
+    ]}
+}), flush=True)
+print(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'done'}]}}), flush=True)
+print(json.dumps({'type':'result','usage':{'input_tokens':1,'output_tokens':1}}), flush=True)
+""",
+    )
+    starts: list = []
+    results: list = []
+    agent = SimpleNamespace(_interrupt_requested=False)
+
+    response = run_claude_cli_streaming(
+        {"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "do it"}], "mcp_tools": False},
+        agent=agent,
+        binary=_python_binary_with_script(binary, script),
+        on_tool_start=lambda tid, name, args: starts.append((tid, name, args)),
+        on_tool_result=lambda tid, name, args, text: results.append((tid, name, args, text)),
+    )
+
+    assert starts == [("toolu_X", "terminal", {"command": "echo hi"})]
+    assert results == [("toolu_X", "terminal", {"command": "echo hi"}, "hi")]
+    assert response.choices[0].message.content == "done"
+
+
+def test_run_claude_cli_streaming_tool_event_fires_on_first_delta(tmp_path):
+    binary, script = _write_fake_claude(
+        tmp_path,
+        """
+import json, sys
+sys.stdin.read()
+print(json.dumps({'type':'system','session_id':'sess_first'}), flush=True)
+print(json.dumps({
+    'type':'assistant',
+    'message':{'content':[
+        {'type':'tool_use','id':'toolu_F','name':'mcp__hermes-tools__read_file','input':{'path':'/x'}}
+    ]}
+}), flush=True)
+print(json.dumps({'type':'result','usage':{}}), flush=True)
+""",
+    )
+    first = []
+    starts: list = []
+    agent = SimpleNamespace(_interrupt_requested=False)
+
+    run_claude_cli_streaming(
+        {"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "x"}], "mcp_tools": False},
+        agent=agent,
+        binary=_python_binary_with_script(binary, script),
+        on_first_delta=lambda: first.append(True),
+        on_tool_start=lambda tid, name, args: starts.append((tid, name, args)),
+    )
+
+    assert first == [True]
+    assert starts == [("toolu_F", "read_file", {"path": "/x"})]
