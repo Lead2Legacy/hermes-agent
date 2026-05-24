@@ -250,7 +250,14 @@ def _build_mcp_env() -> dict[str, str]:
         "HERMES_REDACT_SECRETS": "true",
         "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
     }
-    for name in ("HERMES_HOME", "HERMES_PROFILE", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
+    for name in (
+        "HERMES_HOME",
+        "HERMES_PROFILE",
+        "HERMES_SESSION_ID",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+    ):
         value = os.getenv(name)
         if value:
             env[name] = value
@@ -283,9 +290,9 @@ def _write_hermes_tools_mcp_config() -> str:
 
 
 def _claude_mcp_tool_names() -> list[str]:
-    from agent.transports.claude_cli_tools_mcp_server import EXPOSED_TOOLS
+    from agent.transports.claude_cli_tools_mcp_server import available_mcp_tool_names
 
-    return [f"mcp__hermes-tools__{name}" for name in EXPOSED_TOOLS]
+    return available_mcp_tool_names()
 
 
 def _build_claude_cli_command(claude_bin: str, model: str, api_kwargs: dict[str, Any]) -> tuple[list[str], str | None]:

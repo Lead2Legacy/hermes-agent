@@ -14,9 +14,41 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _load_profile_env() -> bool:
+    """Load the active Hermes profile's .env into the MCP server process.
+
+    The Claude CLI adapter intentionally starts this MCP child with a minimal
+    non-secret environment so provider credentials are not handed to Claude
+    itself through process inheritance. Tools such as web_search still need
+    their backend keys, though, and normal Hermes runtime entry points load
+    those from HERMES_HOME/.env before tool discovery. Mirror that behavior
+    inside the MCP server process so GPT/OpenAI and Claude CLI see the same
+    available Hermes tools when the same profile is active.
+    """
+    try:
+        from dotenv import load_dotenv
+        from hermes_constants import get_hermes_home
+    except Exception as exc:  # pragma: no cover - optional dependency guard
+        logger.debug("profile env load skipped: %s", exc)
+        return False
+
+    env_path = Path(get_hermes_home()) / ".env"
+    if not env_path.exists():
+        return False
+    try:
+        return bool(load_dotenv(str(env_path), override=True, encoding="utf-8"))
+    except UnicodeDecodeError:
+        return bool(load_dotenv(str(env_path), override=True, encoding="latin-1"))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("profile env load failed for %s: %s", env_path, exc)
+        return False
+
 
 EXPOSED_TOOLS: tuple[str, ...] = (
     "terminal", "process", "read_file", "write_file", "patch", "search_files",
@@ -31,28 +63,48 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
-def _build_server() -> Any:
-    try:
-        from mcp.server.fastmcp import FastMCP
-    except ImportError as exc:
-        raise ImportError(f"requires mcp package: {exc}") from exc
+def _available_exposed_tool_specs() -> dict[str, dict[str, Any]]:
+    """Return currently available Hermes tool schemas for EXPOSED_TOOLS.
 
-    from model_tools import get_tool_definitions, handle_function_call
-
-    mcp = FastMCP(
-        "hermes-tools",
-        instructions="Hermes tool surface for Claude CLI runtime.",
-    )
+    This applies the same toolset/check_fn filtering as the normal Hermes
+    runtime. Names may be listed in EXPOSED_TOOLS as a policy allow-list but
+    absent here when the active profile lacks credentials (web/vision/TTS) or
+    runtime gates (kanban worker/orchestrator env).
+    """
+    from model_tools import get_tool_definitions
 
     all_defs = {
         td["function"]["name"]: td["function"]
         for td in (get_tool_definitions(quiet_mode=True) or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
+    return {name: all_defs[name] for name in EXPOSED_TOOLS if name in all_defs}
+
+
+def available_mcp_tool_names() -> list[str]:
+    """Return Claude CLI MCP tool names that will actually be registered."""
+    _load_profile_env()
+    return [f"mcp__hermes-tools__{name}" for name in _available_exposed_tool_specs()]
+
+
+def _build_server() -> Any:
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError as exc:
+        raise ImportError(f"requires mcp package: {exc}") from exc
+
+    from model_tools import handle_function_call
+
+    mcp = FastMCP(
+        "hermes-tools",
+        instructions="Hermes tool surface for Claude CLI runtime.",
+    )
+
+    available_specs = _available_exposed_tool_specs()
 
     exposed_count = 0
     for name in EXPOSED_TOOLS:
-        spec = all_defs.get(name)
+        spec = available_specs.get(name)
         if spec is None:
             logger.debug("skipping %s — not registered", name)
             continue
@@ -99,6 +151,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     os.environ.setdefault("HERMES_QUIET", "1")
     os.environ.setdefault("HERMES_REDACT_SECRETS", "true")
+    _load_profile_env()
     try:
         server = _build_server()
     except ImportError as exc:
