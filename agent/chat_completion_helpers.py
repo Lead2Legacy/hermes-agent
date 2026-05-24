@@ -1212,11 +1212,33 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent.api_mode == "claude_cli":
         from agent.claude_cli_adapter import run_claude_cli_streaming
 
+        def _claude_on_tool_start(tc_id, name, args):
+            try:
+                agent._fire_tool_gen_started(name)
+            except Exception:
+                pass
+            cb = getattr(agent, "tool_start_callback", None)
+            if cb is not None:
+                try:
+                    cb(tc_id, name, args)
+                except Exception:
+                    pass
+
+        def _claude_on_tool_result(tc_id, name, args, result_text):
+            cb = getattr(agent, "tool_complete_callback", None)
+            if cb is not None:
+                try:
+                    cb(tc_id, name, args, result_text)
+                except Exception:
+                    pass
+
         return run_claude_cli_streaming(
             api_kwargs,
             agent=agent,
             on_text_delta=agent._fire_stream_delta if agent._has_stream_consumers() else None,
             on_first_delta=on_first_delta,
+            on_tool_start=_claude_on_tool_start,
+            on_tool_result=_claude_on_tool_result,
         )
 
     if agent.api_mode == "codex_responses":
