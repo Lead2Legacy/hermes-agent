@@ -242,6 +242,7 @@ _VALID_API_MODES = {
     "codex_responses",
     "anthropic_messages",
     "bedrock_converse",
+    "claude_cli",
     # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
     # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
     # instead of Hermes' tool dispatch. Gated behind config key
@@ -1215,6 +1216,16 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+
+    if requested_provider == "claude-cli":
+        return {
+            "provider": "claude-cli",
+            "api_mode": "claude_cli",
+            "base_url": "claude-cli://local",
+            "api_key": "",
+            "source": "claude-cli",
+            "requested_provider": requested_provider,
+        }
 
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would

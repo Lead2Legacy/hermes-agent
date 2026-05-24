@@ -120,6 +120,19 @@ def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
     assert resolved.get("credential_pool") is None
 
 
+def test_resolve_runtime_provider_claude_cli(monkeypatch):
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "claude-cli", "default": "claude-sonnet-4-6"})
+
+    resolved = rp.resolve_runtime_provider(requested="claude-cli")
+
+    assert resolved["provider"] == "claude-cli"
+    assert resolved["api_mode"] == "claude_cli"
+    assert resolved["base_url"] == "claude-cli://local"
+    assert resolved["api_key"] == ""
+    assert resolved["source"] == "claude-cli"
+    assert resolved["requested_provider"] == "claude-cli"
+
+
 def test_resolve_runtime_provider_codex(monkeypatch):
     monkeypatch.setattr(
         rp,

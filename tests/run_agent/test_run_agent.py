@@ -73,6 +73,29 @@ def agent():
         return a
 
 
+def test_aiagent_init_accepts_claude_cli_without_openai_client():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+    ):
+        agent = AIAgent(
+            model="claude-sonnet-4-6",
+            provider="claude-cli",
+            api_mode="claude_cli",
+            base_url="claude-cli://local",
+            api_key="",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent.provider == "claude-cli"
+    assert agent.api_mode == "claude_cli"
+    assert agent.client is None
+    mock_openai.assert_not_called()
+
+
 @pytest.fixture()
 def agent_with_memory_tool():
     """Agent whose valid_tool_names includes 'memory'."""

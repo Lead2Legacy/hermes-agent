@@ -90,6 +90,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    if agent.api_mode == "claude_cli":
+        from agent.claude_cli_adapter import run_claude_cli_completion
+
+        agent._touch_activity("calling Claude CLI")
+        return run_claude_cli_completion(api_kwargs)
+
     result = {"response": None, "error": None}
     request_client_holder = {"client": None}
     request_client_lock = threading.Lock()
@@ -248,6 +254,18 @@ def interruptible_api_call(agent, api_kwargs: dict):
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
+
+    if agent.api_mode == "claude_cli":
+        # Text-only first slice: no Hermes tool schemas are forwarded yet.
+        # Tool use will be added through the Claude CLI MCP bridge.
+        kwargs = {
+            "model": agent.model,
+            "messages": api_messages,
+        }
+        timeout = (getattr(agent, "request_overrides", None) or {}).get("timeout")
+        if timeout:
+            kwargs["timeout"] = timeout
+        return kwargs
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -1190,6 +1208,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     """
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
+
+    if agent.api_mode == "claude_cli":
+        from agent.claude_cli_adapter import run_claude_cli_completion
+
+        response = run_claude_cli_completion(api_kwargs)
+        content = ""
+        try:
+            content = response.choices[0].message.content or ""
+        except Exception:
+            content = ""
+        if content and agent._has_stream_consumers():
+            if on_first_delta:
+                try:
+                    on_first_delta()
+                except Exception:
+                    pass
+            agent._fire_stream_delta(content)
+        return response
 
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch

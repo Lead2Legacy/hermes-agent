@@ -194,6 +194,17 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     if bound_host in {"0.0.0.0", "::"}:
         return True
 
+    # Explicit operator allowlist for trusted reverse proxies such as Tailscale
+    # Serve. This preserves the default DNS-rebinding protection while allowing
+    # localhost-bound dashboards to be reached via a tailnet hostname.
+    extra_hosts = {
+        item.strip().lower()
+        for item in os.environ.get("HERMES_DASHBOARD_EXTRA_HOSTS", "").split(",")
+        if item.strip()
+    }
+    if host_only in extra_hosts:
+        return True
+
     # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
